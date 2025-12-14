@@ -55,7 +55,9 @@ public class Proxy {
                     }
                 }
 
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                // Ignore failed discoveries
+            }
         }
     }
 
@@ -178,12 +180,17 @@ public class Proxy {
     // TCP & UDP Utility
     // =========================
     private static String tryTCP(String address, int port, String command) {
-        try (Socket socket = new Socket(address, port);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+        try {
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress(address, port), 2000); // 2 second timeout
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
 
             out.println(command.trim());
-            return in.readLine();
+            String response = in.readLine();
+            
+            socket.close();
+            return response;
 
         } catch (Exception e) {
             return null;
@@ -192,7 +199,7 @@ public class Proxy {
 
     private static String tryUDP(String address, int port, String command) {
         try (DatagramSocket ds = new DatagramSocket()) {
-            ds.setSoTimeout(5000);
+            ds.setSoTimeout(2000); // 2 second timeout
 
             byte[] data = (command + "\n").getBytes();
             DatagramPacket p = new DatagramPacket(data, data.length, InetAddress.getByName(address), port);
@@ -373,11 +380,13 @@ public class Proxy {
 
         System.out.println("Proxy starting at port: " + port);
 
+        // Discover servers and proxies first
+        discoverServerKeys(serverNodes);
+
+        // Then start listening for clients
         new TCPListener(port).start();
         new UDPListener(port).start();
-
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-
-        discoverServerKeys(serverNodes);
+        
+        System.out.println("Proxy ready and listening on port " + port);
     }
 }
