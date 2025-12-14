@@ -17,6 +17,11 @@ public class Proxy {
         for (String node : serverNodes) {
             try {
                 String[] parts = node.split(":");
+                if (parts.length < 2) {
+                    System.err.println("Invalid node format: " + node);
+                    continue;
+                }
+                
                 String address = parts[0];
                 int port = Integer.parseInt(parts[1]);
 
@@ -62,10 +67,18 @@ public class Proxy {
     }
 
     private static void extractKeys(String node, String response) {
-        String[] parts = response.split(" ");
-        int count = Integer.parseInt(parts[1]);
-        for (int i = 0; i < count; i++) {
-            keyLocation.put(parts[2 + i], node);
+        try {
+            String[] parts = response.split(" ");
+            if (parts.length < 2) return;
+            
+            int count = Integer.parseInt(parts[1]);
+            if (parts.length < count + 2) return; // Validate array bounds
+            
+            for (int i = 0; i < count; i++) {
+                keyLocation.put(parts[2 + i], node);
+            }
+        } catch (NumberFormatException e) {
+            // Ignore malformed responses
         }
     }
 
@@ -242,7 +255,13 @@ public class Proxy {
                     BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                     PrintWriter out = new PrintWriter(socket.getOutputStream(), true)
             ) {
-                String command = in.readLine().trim();
+                String commandLine = in.readLine();
+                if (commandLine == null) {
+                    socket.close();
+                    return;
+                }
+                
+                String command = commandLine.trim();
                 System.out.println("TCP Client command: " + command);
 
                 if (ProxyCommandHandler.handleIfProxyCommand(command, out)) {
