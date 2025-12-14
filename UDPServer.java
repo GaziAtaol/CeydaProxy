@@ -54,7 +54,7 @@ public class UDPServer {
 			int clientPort = packet.getPort();
 			System.out.println("A request received from " + clientAddress.toString() + ":" + clientPort);
 
-			Scanner in = new Scanner(new ByteArrayInputStream(packet.getData()));
+			Scanner in = new Scanner(new ByteArrayInputStream(packet.getData(), 0, packet.getLength()));
 	    	
 			String command = "";
 			String parameter = "";
