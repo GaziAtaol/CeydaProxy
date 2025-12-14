@@ -4,9 +4,9 @@ import java.util.*;
 
 public class Proxy {
 
-    static Map<String, String> serverProtocol = new HashMap<>();
-    static Map<String, String> keyLocation = new HashMap<>();
-    static List<String> knownProxies = new ArrayList<>();
+    static Map<String, String> serverProtocol = Collections.synchronizedMap(new HashMap<>());
+    static Map<String, String> keyLocation = Collections.synchronizedMap(new HashMap<>());
+    static List<String> knownProxies = Collections.synchronizedList(new ArrayList<>());
 
     static final int MAX_HOPS = 10;
 
@@ -17,43 +17,68 @@ public class Proxy {
         for (String node : serverNodes) {
             try {
                 String[] parts = node.split(":");
+                if (parts.length < 2) {
+                    System.err.println("Invalid node format: " + node);
+                    continue;
+                }
+                
                 String address = parts[0];
                 int port = Integer.parseInt(parts[1]);
 
-                // Server discovery
+                boolean foundAsServer = false;
+                
+                // Server discovery - try TCP first
                 String response = tryTCP(address, port, "GET NAMES");
                 if (response != null && response.startsWith("OK")) {
                     serverProtocol.put(node, "TCP");
                     extractKeys(node, response);
-                    continue;
+                    foundAsServer = true;
                 }
-
-                response = tryUDP(address, port, "GET NAMES");
-                if (response != null && response.startsWith("OK")) {
-                    serverProtocol.put(node, "UDP");
-                    extractKeys(node, response);
-                }
-
-                // Proxy discovery (TCP ve UDP)
-                response = tryTCP(address, port, "PROXY HELLO");
-                if ("OK PROXY".equals(response) && !knownProxies.contains(node)) {
-                    knownProxies.add(node);
-                } else {
-                    response = tryUDP(address, port, "PROXY HELLO");
-                    if ("OK PROXY".equals(response) && !knownProxies.contains(node)) {
-                        knownProxies.add(node);
+                
+                // Try UDP if TCP didn't work
+                if (!foundAsServer) {
+                    response = tryUDP(address, port, "GET NAMES");
+                    if (response != null && response.startsWith("OK")) {
+                        serverProtocol.put(node, "UDP");
+                        extractKeys(node, response);
+                        foundAsServer = true;
                     }
                 }
 
-            } catch (Exception ignored) {}
+                // Proxy discovery - check if this is a proxy (can be both server-like and proxy)
+                response = tryTCP(address, port, "PROXY HELLO");
+                if ("OK PROXY".equals(response)) {
+                    if (!knownProxies.contains(node)) {
+                        knownProxies.add(node);
+                    }
+                } else {
+                    response = tryUDP(address, port, "PROXY HELLO");
+                    if ("OK PROXY".equals(response)) {
+                        if (!knownProxies.contains(node)) {
+                            knownProxies.add(node);
+                        }
+                    }
+                }
+
+            } catch (Exception e) {
+                // Ignore failed discoveries
+            }
         }
     }
 
     private static void extractKeys(String node, String response) {
-        String[] parts = response.split(" ");
-        int count = Integer.parseInt(parts[1]);
-        for (int i = 0; i < count; i++) {
-            keyLocation.put(parts[2 + i], node);
+        try {
+            String[] parts = response.split(" ");
+            if (parts.length < 2) return;
+            
+            int count = Integer.parseInt(parts[1]);
+            if (parts.length < count + 2) return; // Validate array bounds
+            
+            for (int i = 0; i < count; i++) {
+                keyLocation.put(parts[2 + i], node);
+            }
+        } catch (NumberFormatException e) {
+            // Ignore malformed responses
         }
     }
 
@@ -80,8 +105,8 @@ public class Proxy {
             String[] parts = command.split(" ");
             if (parts.length < 1) return "NA";
 
-            if ((parts[0].equals("GET") && parts[1].equals("VALUE")) || parts[0].equals("SET")) {
-                String key = parts[0].equals("GET") ? parts[2] : parts[1];
+            if (parts.length >= 2 && parts[0].equals("GET") && parts[1].equals("VALUE") && parts.length >= 3) {
+                String key = parts[2];
 
                 if (keyLocation.containsKey(key)) {
                     String node = keyLocation.get(key);
@@ -92,11 +117,41 @@ public class Proxy {
                     } else {
                         resp = tryUDP(addr[0], Integer.parseInt(addr[1]), command);
                     }
-                    if (resp == null) return "SERVER DOES NOT SUPPORT COMMAND";
+                    if (resp == null) return "NA";
                     return resp;
                 } else {
                     for (String proxy : knownProxies) {
-                        if (visitedProxies.contains(proxy)) continue; // cycle kontrolü
+                        if (visitedProxies.contains(proxy)) continue;
+                        visitedProxies.add(proxy);
+
+                        String[] addr = proxy.split(":");
+                        String resp = tryTCP(addr[0], Integer.parseInt(addr[1]),
+                                "PROXY FORWARD " + command + " " + (hopsLeft - 1));
+
+                        visitedProxies.remove(proxy);
+                        if (resp != null && !resp.equals("NA")) return resp;
+                    }
+                    return "NA";
+                }
+            }
+
+            if (parts.length >= 3 && parts[0].equals("SET")) {
+                String key = parts[1];
+
+                if (keyLocation.containsKey(key)) {
+                    String node = keyLocation.get(key);
+                    String[] addr = node.split(":");
+                    String resp;
+                    if ("TCP".equals(serverProtocol.get(node))) {
+                        resp = tryTCP(addr[0], Integer.parseInt(addr[1]), command);
+                    } else {
+                        resp = tryUDP(addr[0], Integer.parseInt(addr[1]), command);
+                    }
+                    if (resp == null) return "NA";
+                    return resp;
+                } else {
+                    for (String proxy : knownProxies) {
+                        if (visitedProxies.contains(proxy)) continue;
                         visitedProxies.add(proxy);
 
                         String[] addr = proxy.split(":");
@@ -111,12 +166,18 @@ public class Proxy {
             }
 
             if (parts[0].equals("QUIT")) {
+                // Send QUIT to all servers
                 for (String node : serverProtocol.keySet()) {
                     String[] addr = node.split(":");
                     if ("TCP".equals(serverProtocol.get(node)))
                         tryTCP(addr[0], Integer.parseInt(addr[1]), "QUIT");
                     else
                         tryUDP(addr[0], Integer.parseInt(addr[1]), "QUIT");
+                }
+                // Send QUIT to all proxies
+                for (String proxy : knownProxies) {
+                    String[] addr = proxy.split(":");
+                    tryTCP(addr[0], Integer.parseInt(addr[1]), "QUIT");
                 }
                 System.exit(0);
             }
@@ -132,12 +193,17 @@ public class Proxy {
     // TCP & UDP Utility
     // =========================
     private static String tryTCP(String address, int port, String command) {
-        try (Socket socket = new Socket(address, port);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+        try {
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress(address, port), 2000); // 2 second timeout
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
 
             out.println(command.trim());
-            return in.readLine();
+            String response = in.readLine();
+            
+            socket.close();
+            return response;
 
         } catch (Exception e) {
             return null;
@@ -146,7 +212,7 @@ public class Proxy {
 
     private static String tryUDP(String address, int port, String command) {
         try (DatagramSocket ds = new DatagramSocket()) {
-            ds.setSoTimeout(5000);
+            ds.setSoTimeout(2000); // 2 second timeout
 
             byte[] data = (command + "\n").getBytes();
             DatagramPacket p = new DatagramPacket(data, data.length, InetAddress.getByName(address), port);
@@ -189,7 +255,13 @@ public class Proxy {
                     BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                     PrintWriter out = new PrintWriter(socket.getOutputStream(), true)
             ) {
-                String command = in.readLine().trim();
+                String commandLine = in.readLine();
+                if (commandLine == null) {
+                    socket.close();
+                    return;
+                }
+                
+                String command = commandLine.trim();
                 System.out.println("TCP Client command: " + command);
 
                 if (ProxyCommandHandler.handleIfProxyCommand(command, out)) {
@@ -197,10 +269,27 @@ public class Proxy {
                     return;
                 }
 
-                if (command.startsWith("PROXY FORWARD "))
-                    command = command.substring(14);
-
-                String response = Proxy.forwardCommand(command);
+                String response;
+                if (command.startsWith("PROXY FORWARD ")) {
+                    // Parse: "PROXY FORWARD <actual_command> <hops>"
+                    String remainder = command.substring(14); // Remove "PROXY FORWARD "
+                    int lastSpace = remainder.lastIndexOf(' ');
+                    if (lastSpace > 0) {
+                        try {
+                            int hops = Integer.parseInt(remainder.substring(lastSpace + 1));
+                            String actualCommand = remainder.substring(0, lastSpace);
+                            response = Proxy.forwardCommand(actualCommand, hops, new HashSet<>());
+                        } catch (NumberFormatException e) {
+                            // If parsing fails, treat entire remainder as command
+                            response = Proxy.forwardCommand(remainder);
+                        }
+                    } else {
+                        response = Proxy.forwardCommand(remainder);
+                    }
+                } else {
+                    response = Proxy.forwardCommand(command);
+                }
+                
                 if (response != null) out.println(response);
 
                 socket.close();
@@ -229,13 +318,35 @@ public class Proxy {
                     String command = new String(packet.getData(), 0, packet.getLength()).trim();
                     System.out.println("UDP Client command: " + command);
 
-                    if (command.startsWith("PROXY FORWARD "))
-                        command = command.substring(14);
-
-                    String response = Proxy.forwardCommand(command);
+                    String response;
+                    
+                    // Handle PROXY HELLO command
+                    if (command.equals("PROXY HELLO")) {
+                        response = "OK PROXY";
+                    } else if (command.startsWith("PROXY FORWARD ")) {
+                        // Parse: "PROXY FORWARD <actual_command> <hops>"
+                        String remainder = command.substring(14); // Remove "PROXY FORWARD "
+                        int lastSpace = remainder.lastIndexOf(' ');
+                        if (lastSpace > 0) {
+                            try {
+                                int hops = Integer.parseInt(remainder.substring(lastSpace + 1));
+                                String actualCommand = remainder.substring(0, lastSpace);
+                                response = Proxy.forwardCommand(actualCommand, hops, new HashSet<>());
+                            } catch (NumberFormatException e) {
+                                // If parsing fails, treat entire remainder as command
+                                response = Proxy.forwardCommand(remainder);
+                            }
+                        } else {
+                            response = Proxy.forwardCommand(remainder);
+                        }
+                    } else {
+                        response = Proxy.forwardCommand(command);
+                    }
+                    
                     if (response != null) {
+                        byte[] responseBytes = response.getBytes();
                         DatagramPacket reply = new DatagramPacket(
-                                response.getBytes(), response.length(),
+                                responseBytes, responseBytes.length,
                                 packet.getAddress(), packet.getPort());
                         socket.send(reply);
                     }
@@ -288,11 +399,13 @@ public class Proxy {
 
         System.out.println("Proxy starting at port: " + port);
 
+        // Discover servers and proxies first
+        discoverServerKeys(serverNodes);
+
+        // Then start listening for clients
         new TCPListener(port).start();
         new UDPListener(port).start();
-
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-
-        discoverServerKeys(serverNodes);
+        
+        System.out.println("Proxy ready and listening on port " + port);
     }
 }
